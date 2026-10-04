@@ -7,6 +7,7 @@ import argparse
 import glob
 import os
 import random
+from multiprocessing import Pool
 
 import pandas as pd
 
@@ -51,16 +52,35 @@ def load_bars(path, tf):
     return bars, spread
 
 
+def load_cached(path, tf, cache):
+    if os.path.exists(cache):
+        d = pd.read_parquet(cache)
+        print(f"تم تحميل الشموع من الكاش: {cache}")
+        return d["px"], float(d["spread"].iloc[0])
+    bars, spread = load_bars(path, tf)
+    pd.DataFrame({"px": bars, "spread": spread}).to_parquet(cache)
+    return bars, spread
+
+
+def run_one(args):
+    p, px, cut, fee = args
+    tr = backtest(p, px[:cut], fee)
+    te = backtest(p, px[cut - warmup(p):], fee)
+    return tr["return"], te["return"], te["trades"], te["max_drawdown"], p
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", default=r"F:\Raw date\parquet_ticks\GBPUSD")
-    ap.add_argument("--tf", default="5min")
+    ap.add_argument("--tf", default="1h")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--cache", default=None, help="ملف كاش للشموع (يُنشأ تلقائياً)")
+    ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--train", type=float, default=0.7)
     a = ap.parse_args()
 
-    bars, spread = load_bars(a.path, a.tf)
+    bars, spread = load_cached(a.path, a.tf, a.cache or f"bars_{a.tf}.parquet")
     px = bars.tolist()
     cut = int(len(px) * a.train)
     fee = spread / 2  # نصف السبريد لكل جانب
@@ -68,12 +88,9 @@ def main():
           f"السبريد المتوسط: {spread * 1e4:.2f} نقطة أساس")
 
     rng = random.Random(a.seed)
-    rows = []
-    for _ in range(a.n):
-        p = random_strategy(rng)
-        tr = backtest(p, px[:cut], fee)
-        te = backtest(p, px[cut - warmup(p):], fee)
-        rows.append((tr["return"], te["return"], te["trades"], te["max_drawdown"], p))
+    jobs = [(random_strategy(rng), px, cut, fee) for _ in range(a.n)]
+    with Pool(a.workers) as pool:
+        rows = pool.map(run_one, jobs)
     rows.sort(key=lambda r: r[0], reverse=True)
 
     print("\nأفضل 10 على فترة التدريب، ونتيجتها على فترة الاختبار (خارج العينة):")
