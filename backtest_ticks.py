@@ -10,6 +10,7 @@ import random
 from multiprocessing import Pool
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from random_strategy import backtest, random_strategy, warmup
 
@@ -30,23 +31,25 @@ def load_bars(path, tf):
         raise SystemExit(f"لا توجد ملفات parquet في: {path}")
     print(f"عدد الملفات: {len(files)}")
     parts, spreads = [], []
-    for f in files:
-        d = pd.read_parquet(f)
-        ts = pick(d.columns, TS_NAMES)
-        if ts is None:
-            d = d.reset_index()
-            ts = pick(d.columns, TS_NAMES) or d.columns[0]
-        bid, ask = pick(d.columns, BID_NAMES), pick(d.columns, ASK_NAMES)
-        if bid and ask:
-            mid = (d[bid] + d[ask]) / 2
-            spreads.append(((d[ask] - d[bid]) / mid).mean())
-        else:
-            p = pick(d.columns, PRICE_NAMES)
-            if p is None:
-                raise SystemExit(f"أعمدة غير معروفة: {list(d.columns)}")
-            mid = d[p]
-        t = pd.to_datetime(d[ts], utc=True)
-        parts.append(mid.groupby(t.dt.floor(tf)).last())
+    for k, f in enumerate(files, 1):
+        pf = pq.ParquetFile(f)
+        cols = pf.schema_arrow.names
+        ts = pick(cols, TS_NAMES) or cols[0]
+        bid, ask = pick(cols, BID_NAMES), pick(cols, ASK_NAMES)
+        price = None if (bid and ask) else pick(cols, PRICE_NAMES)
+        if not (bid and ask) and price is None:
+            raise SystemExit(f"أعمدة غير معروفة: {cols}")
+        use = [ts] + ([bid, ask] if bid and ask else [price])
+        for batch in pf.iter_batches(batch_size=2_000_000, columns=use):
+            d = batch.to_pandas()
+            if bid and ask:
+                mid = (d[bid] + d[ask]) / 2
+                spreads.append(((d[ask] - d[bid]) / mid).mean())
+            else:
+                mid = d[price]
+            t = pd.to_datetime(d[ts], utc=True)
+            parts.append(mid.groupby(t.dt.floor(tf)).last())
+        print(f"[{k}/{len(files)}] {os.path.basename(f)}", flush=True)
     bars = pd.concat(parts).groupby(level=0).last().sort_index().dropna()
     spread = sum(spreads) / len(spreads) if spreads else 0.0001
     return bars, spread
